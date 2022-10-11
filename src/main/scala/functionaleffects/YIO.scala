@@ -1,5 +1,8 @@
 package functionaleffects
 
+import java.util.concurrent.atomic.AtomicBoolean
+import scala.annotation.tailrec
+
 // ZIO[R, E, A]
 // R == services required
 // E == how the worflow can fail
@@ -14,6 +17,12 @@ trait YIO[+A] { self =>
 
   def flatMap[B](f: A => YIO[B]): YIO[B] =
     FlatMap(self, f)
+
+  def fork: YIO[Fiber[A]] = YIO.succeed {
+    val fiber = RuntimeFiber(self)
+    fiber.start()
+    fiber
+  }
 
   def *>[B](that: YIO[B]): YIO[B] =
     zipRight(that)
@@ -34,13 +43,33 @@ trait YIO[+A] { self =>
   def zipRight[B](that: YIO[B]): YIO[B] =
     zipWith(that)((_, b) => b)
 
-  def unsafeRun(): Unit = {
+  def unsafeRunAsync(): Unit = {
     val fiber = RuntimeFiber(self)
-    fiber.unsafeRun
+    fiber.start()
+  }
+
+  def unsafeRunSync(): A = {
+    var result: A = null.asInstanceOf[A]
+    val latch     = new java.util.concurrent.CountDownLatch(1)
+    self
+      .flatMap { a =>
+        YIO.succeed {
+          result = a
+          latch.countDown
+        }
+      }
+      .unsafeRunAsync()
+
+    latch.await()
+    result
   }
 }
 
 object YIO {
+  // register gives callback which we can provide
+  def async[A](register: (YIO[A] => Unit) => Any): YIO[A] =
+    Async(register)
+
   def succeed[A](value: A): YIO[A] =
     Succeed(() => value) // lazy evaluation - zero-args function
 
@@ -49,19 +78,16 @@ object YIO {
   // primitives for effects
   final case class FlatMap[A, B](first: YIO[A], andThen: A => YIO[B]) extends YIO[B]
   final case class Succeed[A](value: () => A)                         extends YIO[A]
+  final case class Async[A](register: (YIO[A] => Unit) => Any)        extends YIO[A]
 }
 
 trait Fiber[+A] {
-  def unsafeRun(): A
-
+  def join: YIO[A]
 }
 
-object Fiber {
-  def apply[A](yio: YIO[A]): Fiber[A] =
-    ???
-}
+final case class RuntimeFiber[A](yio: YIO[A]) extends Fiber[A] {
 
-final case class RuntimeFiber[+A](yio: YIO[A]) extends Fiber[A] {
+  private val executor = scala.concurrent.ExecutionContext.global
 
   type ErasedYIO          = YIO[Any]
   type ErasedContinuation = Any => YIO[Any]
@@ -72,7 +98,76 @@ final case class RuntimeFiber[+A](yio: YIO[A]) extends Fiber[A] {
   // result of previous to a new one
   private val stack = scala.collection.mutable.Stack[ErasedContinuation]()
 
-  def unsafeRun(): A = {
+  // actor-like fibers have inbox
+  private val inbox =
+    new java.util.concurrent.ConcurrentLinkedQueue[FiberMessage]
+
+  private val running: AtomicBoolean = new AtomicBoolean(false)
+
+  private val observers =
+    scala.collection.mutable.Set[YIO[Any] => Unit]()
+
+  private var exit: A =
+    null.asInstanceOf[A]
+
+  private def offerToInbox(fiberMessage: FiberMessage): Unit = {
+    inbox.offer(fiberMessage)
+
+    if (running.compareAndSet(false, true)) {
+      drainQueueOnCurrentThread()
+    }
+  }
+
+  private def drainQueueOnExecutor(): Unit =
+    executor.execute(() => drainQueueOnCurrentThread())
+
+  @tailrec
+  private def drainQueueOnCurrentThread(): Unit = {
+    var fiberMessage = inbox.poll()
+
+    while (fiberMessage != null) {
+      processFiberMessage(fiberMessage)
+      fiberMessage = inbox.poll()
+    }
+
+    running.set(false)
+
+    // if in between someone else added something
+    if (!inbox.isEmpty) {
+      if (running.compareAndSet(false, true)) {
+        drainQueueOnCurrentThread()
+      }
+    }
+
+  }
+
+  // guaranteed to be single-threaded
+  private def processFiberMessage(fiberMessage: FiberMessage): Unit =
+    fiberMessage match {
+      case FiberMessage.Resume(yio) =>
+        currentYIO = yio
+        runLoop()
+
+      case FiberMessage.Start =>
+        runLoop()
+
+      case FiberMessage.AddObserver(observer) =>
+        if (exit == null) {
+          observers.add(observer)
+        } else {
+          observer(YIO.succeed(exit))
+        }
+    }
+
+  def start(): Unit =
+    offerToInbox(FiberMessage.Start)
+
+  override def join: YIO[A] =
+    YIO.async { cb =>
+      offerToInbox(FiberMessage.AddObserver(cb.asInstanceOf[YIO[Any] => Unit]))
+    }
+
+  private def runLoop(): Unit = {
     var loop      = true
     var result: A = null.asInstanceOf[A]
 
@@ -84,8 +179,9 @@ final case class RuntimeFiber[+A](yio: YIO[A]) extends Fiber[A] {
           // we losing type information just like Java in runtime
           val computedValue = value()
           if (stack.isEmpty) {
+            exit = computedValue.asInstanceOf[A]
+            observers.foreach(_(YIO.succeed(exit)))
             loop = false
-            result = computedValue.asInstanceOf[A]
           } else {
             val nextContinuation = stack.pop()
             currentYIO = nextContinuation(computedValue)
@@ -94,10 +190,26 @@ final case class RuntimeFiber[+A](yio: YIO[A]) extends Fiber[A] {
         case YIO.FlatMap(first, andThen) =>
           currentYIO = first
           stack.push(andThen)
+
+        // we want to stop loop
+        // then we restart the loop with register
+        // actor-based encoding of fibers
+        case YIO.Async(register) =>
+          currentYIO = null
+          loop = false
+          register(yio => offerToInbox(FiberMessage.Resume(yio)))
       }
 
     result
 
+  }
+
+  sealed trait FiberMessage
+  object FiberMessage {
+    // when YIO is done - whoever done it should send us a message about it
+    final case class AddObserver(cb: YIO[Any] => Unit) extends FiberMessage
+    final case class Resume(yio: YIO[Any])             extends FiberMessage
+    final case object Start                            extends FiberMessage
   }
 }
 
@@ -108,5 +220,26 @@ object Example extends App {
   val sayHelloFiveTimes =
     sayHello.repeatN(5)
 
-  sayHelloFiveTimes.unsafeRun()
+  sayHelloFiveTimes.unsafeRunAsync()
+
+  val left = YIO.succeed {
+    Thread.sleep(5000)
+    "left"
+  }
+
+  val right = YIO.succeed {
+    Thread.sleep(5000)
+    "right"
+  }
+
+  val parallel = for {
+    fiber1     <- left.fork
+    fiber2     <- right.fork
+    leftValue  <- fiber1.join
+    rightValue <- fiber2.join
+    _          <- YIO.succeed(println(leftValue, rightValue))
+  } yield ()
+
+  parallel.unsafeRunSync()
+
 }
