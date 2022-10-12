@@ -36,12 +36,15 @@ object InterruptGuarantees extends ZIOSpecDefault {
         ref     <- Ref.make(0)
         latch   <- Promise.make[Nothing, Unit]
         promise <- Promise.make[Nothing, Unit]
-        fiber   <- (latch.succeed(()) *> promise.await).ensuring(ref.update(_ + 1)).forkDaemon
-        _ <- latch.await // await until fiber starts before interrupting
-        _       <- fiber.interrupt
-        v       <- ref.get
-      } yield assertTrue(v == 0)
-    } @@ ignore +
+
+        // this fiber stuck on promise.await since noone complete it
+        // ensuring will update ref so test shouls expect 1
+        fiber <- (latch.succeed(()) *> promise.await).ensuring(ref.update(_ + 1)).forkDaemon
+        _ <- latch.await     // await until fiber starts before interrupting
+        _ <- fiber.interrupt // interrpution will trigger ensuring method
+        v     <- ref.get
+      } yield assertTrue(v == 1)
+    } @@ nonFlaky + // nonFlaky - run 100 times to be sure concurrency is right
       test("onExit") {
 
         /** EXERCISE
@@ -55,9 +58,19 @@ object InterruptGuarantees extends ZIOSpecDefault {
           _ <- latch.await // await until fiber starts before interrupting
           _       <- fiber.interrupt
           exit    <- promise.await
-        } yield assertTrue(false)
-      } @@ ignore +
+        } yield assertTrue(exit.isInterrupted)
+      } @@ nonFlaky +
       test("acquireRelease") {
+
+        // 1. acquire (open file)
+        // 2. use (do smth)
+        // 3. release (close file)
+
+        // acquire will be uninterruptible
+        // use will be interruptable
+        // release will be uninterruptible
+        // if acquire successfully completes execution then release will be executed as
+        // soon as use completes with success, failure or interrution
         import java.net.Socket
 
         def acquireSocket: UIO[Socket]              = ZIO.never
@@ -70,11 +83,20 @@ object InterruptGuarantees extends ZIOSpecDefault {
           */
         for {
           latch <- Promise.make[Nothing, Unit]
+          // acquireSocket is stuck on ZIO.never, it will never complete
           fiber <- ZIO.acquireReleaseWith(latch.succeed(()) *> acquireSocket)(releaseSocket(_))(useSocket(_)).forkDaemon
+          // so join will not get anything and disconnect in 1 sec
           value <- latch.await *> Live.live(fiber.join.disconnect.timeout(1.second))
-        } yield assertTrue(value == Some(42))
+        } yield assertTrue(value == None)
       }
   }
+}
+
+object Example {
+
+  ZIO.debug("Hello").uninterruptible *>
+    ZIO.debug("World").interruptible *>
+    ZIO.debug("!").uninterruptible
 }
 
 object InterruptibilityRegions extends ZIOSpecDefault {
@@ -88,11 +110,11 @@ object InterruptibilityRegions extends ZIOSpecDefault {
       for {
         ref   <- Ref.make(0)
         latch <- Promise.make[Nothing, Unit]
-        fiber <- (latch.succeed(()) *> Live.live(ZIO.sleep(10.millis)) *> ref.update(_ + 1)).forkDaemon
+        fiber <- (latch.succeed(()) *> Live.live(ZIO.sleep(10.millis)) *> ref.update(_ + 1)).uninterruptible.forkDaemon
         _     <- latch.await *> fiber.interrupt
         value <- ref.get
       } yield assertTrue(value == 1)
-    } @@ ignore +
+    } @@ nonFlaky +
       test("interruptible") {
 
         /** EXERCISE
@@ -103,11 +125,13 @@ object InterruptibilityRegions extends ZIOSpecDefault {
 
           ref   <- Ref.make(0)
           latch <- Promise.make[Nothing, Unit]
-          fiber <- ZIO.uninterruptible(latch.succeed(()) *> ZIO.never).ensuring(ref.update(_ + 1)).forkDaemon
+          fiber <- ZIO.interruptible(latch.succeed(()) *> ZIO.never).ensuring(ref.update(_ + 1)).forkDaemon
+          /* disconnect - if this thing gets interrupted - do this in background without waiting for interruption
+           * complete */
           _     <- Live.live(latch.await *> fiber.interrupt.disconnect.timeout(1.second))
           value <- ref.get
         } yield assertTrue(value == 1)
-      } @@ ignore
+      } @@ nonFlaky
   }
 }
 
@@ -131,11 +155,12 @@ object Backpressuring extends ZIOSpecDefault {
           latch <- Promise.make[Nothing, Unit]
           left   = latch.succeed(()).ensuring(ZIO.sleep(1.seconds))
           right  = latch.await *> ZIO.fail("Uh oh!")
-          _     <- left.zipPar(right).ignore
+          // disconnect will not wait ensuring so test will pass
+          _     <- left.disconnect.zipPar(right).ignore
           end   <- Clock.instant
           delta  = end.getEpochSecond() - start.getEpochSecond()
         } yield assertTrue(delta < 1))
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Find the appropriate place to add the `disconnect` operator to ensure that even if an effect refuses to be
@@ -144,11 +169,28 @@ object Backpressuring extends ZIOSpecDefault {
         test("disconnect") {
           Live.live(for {
             ref <- Ref.make(true)
-            _   <- (ZIO.sleep(5.seconds) *> ref.set(false)).uninterruptible.timeout(10.millis)
+            _   <- (ZIO.sleep(5.seconds) *> ref.set(false)).uninterruptible.disconnect.raceAwait(ZIO.sleep(10.millis))
             v   <- ref.get
           } yield assertTrue(v))
-        }
+        } @@ nonFlaky
     }
+}
+
+// solve with this:
+// interruptible
+// uninterruptible
+// foldCauseZIO -- effectfil fold with failure
+
+object FoldExample extends ZIOAppDefault {
+  val zio = ZIO.fail(1)
+
+  def example[R, E, A](zio: ZIO[R, E, A]): ZIO[R, E, A] = zio.foldCauseZIO(
+    cause => ZIO.debug(s"go cause $cause") *> ZIO.failCause(cause),
+    value => ZIO.debug(s"got value $value") *> ZIO.succeed(value)
+  )
+
+  val run = example(zio)
+
 }
 
 /** ZIO's multitude of operators that protect against interruption are not necessarily intrinsic: they can be derived
@@ -165,7 +207,13 @@ object BasicDerived extends ZIOSpecDefault {
         */
       test("ensuring") {
         def withFinalizer[R, E, A](zio: ZIO[R, E, A])(finalizer: UIO[Any]): ZIO[R, E, A] =
-          zio <* finalizer
+          zio.interruptible  // we don't want given method to be uniunterruptible
+            .foldCauseZIO(
+              cause => finalizer *> ZIO.failCause(cause),
+              value => finalizer *> ZIO.succeed(value)
+            )
+            .uninterruptible // we want only the fold to be interruptible
+        // the same as onExit(_ => finalizer)
 
         for {
           latch   <- Promise.make[Nothing, Unit]
@@ -176,7 +224,7 @@ object BasicDerived extends ZIOSpecDefault {
           _       <- fiber.interrupt
           v       <- ref.get
         } yield assertTrue(v)
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Using the operators you have learned about so far, reinvent a safe version of `acquireReleaseWith` in the
@@ -186,7 +234,12 @@ object BasicDerived extends ZIOSpecDefault {
           def acquireReleaseWith[R, E, A, B](
               acquire: ZIO[R, E, A]
           )(release: A => UIO[Any])(use: A => ZIO[R, E, B]): ZIO[R, E, B] =
-            acquire.flatMap(a => use(a) <* release(a))
+            acquire.flatMap { a =>
+              use(a).interruptible.foldCauseZIO(
+                cause => release(a) *> ZIO.failCause(cause),
+                value => release(a) *> ZIO.succeed(value)
+              )
+            }.uninterruptible
 
           for {
             latch   <- Promise.make[Nothing, Unit]
@@ -217,8 +270,10 @@ object UninterruptibleMask extends ZIOSpecDefault {
         */
       test("overly interruptible") {
         def doWork[A](queue: Queue[A], worker: A => UIO[Any]) =
-          ZIO.uninterruptible {
-            queue.take.flatMap(a => ZIO.interruptible(worker(a)))
+          // pole in cats effect
+          // uninterruptibleMask is better than uninterruptible(interruptible)
+          ZIO.uninterruptibleMask { restore =>
+            queue.take.flatMap(a => restore(worker(a)))
           }
 
         def worker(database: Ref[Chunk[Int]]): Int => UIO[Any] = {
@@ -239,7 +294,7 @@ object UninterruptibleMask extends ZIOSpecDefault {
           _        <- fiber.interrupt
           data     <- database.get
         } yield assertTrue(data.length == 5)
-      } @@ ignore
+      }
     }
 }
 
