@@ -15,17 +15,18 @@ import scala.annotation.tailrec
 trait YIO[+A] { self =>
   import YIO._
 
+  def *>[B](that: YIO[B]): YIO[B] =
+    zipRight(that)
+
   def flatMap[B](f: A => YIO[B]): YIO[B] =
     FlatMap(self, f)
 
-  def fork: YIO[Fiber[A]] = YIO.succeed {
-    val fiber = RuntimeFiber(self)
-    fiber.start()
-    fiber
-  }
-
-  def *>[B](that: YIO[B]): YIO[B] =
-    zipRight(that)
+  def fork: YIO[Fiber[A]] =
+    YIO.succeed {
+      val fiber = RuntimeFiber(self)
+      fiber.start()
+      fiber
+    }
 
   def map[B](f: A => B): YIO[B] =
     flatMap(a => succeed(f(a)))
@@ -33,15 +34,6 @@ trait YIO[+A] { self =>
   def repeatN(n: Int): YIO[Unit] =
     if (n <= 0) unit
     else self *> repeatN(n - 1)
-
-  def zipWith[B, C](that: YIO[B])(f: (A, B) => C): YIO[C] =
-    for {
-      a <- self
-      b <- that
-    } yield f(a, b)
-
-  def zipRight[B](that: YIO[B]): YIO[B] =
-    zipWith(that)((_, b) => b)
 
   def unsafeRunAsync(): Unit = {
     val fiber = RuntimeFiber(self)
@@ -55,14 +47,42 @@ trait YIO[+A] { self =>
       .flatMap { a =>
         YIO.succeed {
           result = a
-          latch.countDown
+          latch.countDown()
         }
       }
       .unsafeRunAsync()
-
     latch.await()
     result
   }
+
+  def zipRight[B](that: YIO[B]): YIO[B] =
+    zipWith(that)((_, b) => b)
+
+  def zipWith[B, C](that: YIO[B])(f: (A, B) => C): YIO[C] =
+    for {
+      a <- self
+      b <- that
+    } yield f(a, b)
+
+  def zipWithPar[B, C](that: YIO[B])(f: (A, B) => C): YIO[C] =
+    for {
+      left  <- self.fork
+      right <- that.fork
+      a     <- left.join
+      b     <- right.join
+    } yield f(a, b)
+
+  def collectAll[A](yios: List[YIO[A]]): YIO[List[A]] =
+    ???
+
+  def collectAllPar[A](yios: List[YIO[A]]): YIO[List[A]] =
+    ???
+
+  def foreach[A, B](as: List[A])(f: A => YIO[B]): YIO[List[B]] =
+    ???
+
+  def foreachPar[A, B](as: List[A])(f: A => YIO[B]): YIO[List[B]] =
+    ???
 }
 
 object YIO {
@@ -114,7 +134,7 @@ final case class RuntimeFiber[A](yio: YIO[A]) extends Fiber[A] {
     inbox.offer(fiberMessage)
 
     if (running.compareAndSet(false, true)) {
-      drainQueueOnCurrentThread()
+      drainQueueOnExecutor()
     }
   }
 
@@ -168,8 +188,7 @@ final case class RuntimeFiber[A](yio: YIO[A]) extends Fiber[A] {
     }
 
   private def runLoop(): Unit = {
-    var loop      = true
-    var result: A = null.asInstanceOf[A]
+    var loop = true
 
     // interruptions might be called between each step of those loops
     while (loop)
@@ -180,7 +199,7 @@ final case class RuntimeFiber[A](yio: YIO[A]) extends Fiber[A] {
           val computedValue = value()
           if (stack.isEmpty) {
             exit = computedValue.asInstanceOf[A]
-            observers.foreach(_(YIO.succeed(exit)))
+            observers.foreach(_(YIO.succeed(computedValue)))
             loop = false
           } else {
             val nextContinuation = stack.pop()
@@ -199,9 +218,6 @@ final case class RuntimeFiber[A](yio: YIO[A]) extends Fiber[A] {
           loop = false
           register(yio => offerToInbox(FiberMessage.Resume(yio)))
       }
-
-    result
-
   }
 
   sealed trait FiberMessage
