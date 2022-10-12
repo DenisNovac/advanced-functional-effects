@@ -10,6 +10,8 @@ object BasicConcurrency extends ZIOAppDefault {
   //   def set: ZIO[Any, Nothing, Unit]
   //   def update(f: A => A): ZIO[Any, Nothing, Unit]
   //   def modify[B](f: A => (B, A)): ZIO[Any, Nothing, B]
+  //   // there is no update(ZIO(...)) variants. It is because this must be very fast and safe to do multiple times
+  //   // Ref.Synchronized for this but it is slower
   // }
 
   // object Ref {
@@ -61,6 +63,24 @@ object BasicConcurrency extends ZIOAppDefault {
     _ <- ZIO.debug(value) // no fiber join to complete, we just wait promise
   } yield ()
 
-  val run = promiseWorkflow
+  def sayHelloAndIncrementIfEven(ref: Ref[Int]): ZIO[Any, Nothing, Unit] =
+    ref.modify { currentValue =>
+      if (currentValue % 2 == 0)
+        (ZIO.debug("Hello"), currentValue + 1)
+      else
+        (ZIO.unit, currentValue)
+    }.flatten
+
+  def sayHelloWorkflow = for {
+    ref   <- Ref.make(0)
+    _     <- sayHelloAndIncrementIfEven(ref)
+    _     <- sayHelloAndIncrementIfEven(ref)
+    _     <- sayHelloAndIncrementIfEven(ref)
+    _     <- sayHelloAndIncrementIfEven(ref)
+    value <- ref.get
+    _     <- ZIO.debug(value)
+  } yield ()
+
+  val run = sayHelloWorkflow
 
 }
