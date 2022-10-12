@@ -101,6 +101,67 @@ object YIO {
   final case class Async[A](register: (YIO[A] => Unit) => Any)        extends YIO[A]
 }
 
+sealed trait Promise[A] {
+  def await: YIO[A]
+  def succeed(a: A): YIO[Boolean]
+}
+
+object Promise {
+
+  def make[A]: YIO[Promise[A]] =
+    YIO.succeed {
+      val state = new java.util.concurrent.atomic.AtomicReference[State[A]](Empty(Nil))
+
+      new Promise[A] {
+
+        def await: YIO[A] =
+          YIO.async { cb =>
+            var loop = true
+            while (loop) {
+              val currentState = state.get()
+
+              currentState match {
+                case Done(a) =>
+                  loop = false
+                  cb(YIO.succeed(a))
+
+                case Empty(callbacks) =>
+                  if (state.compareAndSet(currentState, Empty(cb :: callbacks))) {
+                    loop = false
+                  }
+              }
+            }
+          }
+
+        def succeed(a: A): YIO[Boolean] =
+          YIO.succeed {
+            var loop   = true
+            var result = false
+            while (loop) {
+              val currentState = state.get()
+              currentState match {
+                case Done(_) =>
+                  loop = false
+
+                case Empty(joiners) =>
+                  if (state.compareAndSet(currentState, Done(a))) {
+                    joiners.foreach(_(YIO.succeed(a)))
+                    result = true
+                    loop = false
+                  }
+              }
+            }
+            result
+          }
+      }
+    }
+
+    sealed trait State[A]
+    final case class Done[A](value: A)                       extends State[A]
+    final case class Empty[A](joiners: List[YIO[A] => Unit]) extends State[A]
+
+}
+
 trait Fiber[+A] {
   def join: YIO[A]
 }
