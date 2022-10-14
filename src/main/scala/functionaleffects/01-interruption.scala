@@ -352,3 +352,39 @@ object Graduation extends ZIOSpecDefault {
         }
     }
 }
+
+/** ZIO 1 had ZManaged
+  *
+  * ZIO 2 made resources into ZIO type itself It allows to compose everything (instead of making Resource in cats for
+  * everything)
+  */
+object ResourceExample extends ZIOAppDefault {
+
+  val acquire1 =
+    ZIO.debug("Acquired resource1")
+
+  val release1 =
+    ZIO.debug("Releasing resource1")
+
+  val acquire2 =
+    ZIO.debug("Acquired resource2")
+
+  val release2 =
+    ZIO.debug("Releasing resource2")
+
+  val resource1: ZIO[Scope, Nothing, Unit] =
+    ZIO.acquireRelease(acquire1)(_ => release1)
+
+  val resource2: ZIO[Scope, Nothing, Unit] =
+    ZIO.acquireRelease(acquire2)(_ => release2)
+
+  val resourceCompose: ZIO[Scope, Nothing, Unit] = for {
+    r1 <- resource1
+    r2 <- resource2
+  } yield ()
+
+  val run = ZIO.scoped { // like Resource.use from cats
+    resourceCompose
+  }
+
+}
