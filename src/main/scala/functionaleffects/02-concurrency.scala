@@ -38,10 +38,15 @@ object QueueBasics extends ZIOSpecDefault {
         */
       test("offer/take") {
         for {
-          ref <- Ref.make(0)
-          v   <- ref.get
+          ref   <- Ref.make(0)
+          queue <- Queue.bounded[Int](16)
+          // if we reomve both forks - the order will matter but not now
+          fiber <- queue.take.flatMap(ref.set).fork // take will wait for queue anyway so we could run it and fork it before putting the value
+          _     <- Live.live(ZIO.sleep(1.second)) *> queue.offer(12).fork
+          _     <- fiber.join
+          v     <- ref.get
         } yield assertTrue(v == 12)
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Create a consumer of this queue that adds each value taken from the queue to the counter, so the unit test
@@ -51,10 +56,12 @@ object QueueBasics extends ZIOSpecDefault {
           for {
             counter <- Ref.make(0)
             queue   <- Queue.bounded[Int](100)
-            _       <- ZIO.foreach(1 to 100)(v => queue.offer(v)).forkDaemon
+            _       <- ZIO.foreach(1 to 100)(v => queue.offer(v)).fork
+            // no need to join since we are waiting for 100 elements in queue in take
+            _       <- queue.takeN(100).flatMap(as => counter.update(_ => as.sum))
             value   <- counter.get
           } yield assertTrue(value == 5050)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Queues are fully concurrent-safe on both producer and consumer side. Choose the appropriate operator to
@@ -64,11 +71,12 @@ object QueueBasics extends ZIOSpecDefault {
           for {
             counter <- Ref.make(0)
             queue   <- Queue.bounded[Int](100)
-            _       <- ZIO.foreach(1 to 100)(v => queue.offer(v)).forkDaemon
+            _       <- ZIO.foreachPar(1 to 100)(v => queue.offer(v)).forkDaemon
+            // because of foreachPar and fork we are starting to take before foreach is done
             _       <- queue.take.flatMap(v => counter.update(_ + v)).repeatN(99)
             value   <- counter.get
           } yield assertTrue(value == 5050)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Choose the appropriate operator to parallelize the consumption side so all values are consumed in parallel.
@@ -78,10 +86,12 @@ object QueueBasics extends ZIOSpecDefault {
             counter <- Ref.make(0)
             queue   <- Queue.bounded[Int](100)
             _       <- ZIO.foreachPar(1 to 100)(v => queue.offer(v)).forkDaemon
-            _       <- queue.take.flatMap(v => counter.update(_ + v)).repeatN(99)
+            // every take will wait for value in parallel
+            _       <- ZIO.foreachPar(1 to 100)(_ => queue.take.flatMap(v => counter.update(_ + v)))
             value   <- counter.get
           } yield assertTrue(value == 5050)
-        } @@ ignore +
+          // no race condition in Queue
+        } @@ nonFlaky +
         /** EXERCISE
           *
           * Shutdown the queue, which will cause its sole producer to be interrupted, resulting in the test succeeding.
@@ -94,10 +104,48 @@ object QueueBasics extends ZIOSpecDefault {
             _      <- (latch.succeed(()) *> queue.offer(1).forever).ensuring(done.set(true)).fork
             _      <- latch.await
             _      <- queue.takeN(100)
+            _ <- queue.shutdown // shutdown will make queue.offer fail and then call ensuring
             isDone <- done.get.repeatWhile(_ == false).timeout(10.millis).some
           } yield assertTrue(isDone)
-        } @@ ignore
+        }
     }
+}
+
+/** Ref:
+  *   - can't compose atomic updates
+  *   - can't wait for some condition
+  *
+  * Promise:
+  *   - can only be completed with exactly one value
+  *
+  * Ref[Promise[E, A]]
+  *
+  * It might be more simple just to use STM. It trade off prefomance for developer productivity.
+  *
+  * STM might be slower than Promise or Ref.
+  *
+  * STM is a journal that holding up all variables in transaction. And at the very end we will commit transaction. If
+  * some variables modified - it will retry the transaction. They helping some concurrencty problems.
+  */
+
+object STMExample extends ZIOAppDefault {
+
+  def transfer(from: Ref[Int], to: Ref[Int]): ZIO[Any, Nothing, Unit] =
+    for {
+      // how to do this correctly so nobody change ref between?
+      _ <- from.update(_ - 1)
+      _ <- to.update(_ + 1)
+    } yield ()
+
+    val program =
+      for {
+        ref1 <- Ref.make(100)
+        ref2 <- Ref.make(0)
+        _    <- ZIO.collectAll(List.fill(100)(transfer(ref1, ref2))).unit
+
+      } yield ()
+
+    val run = ???
 }
 
 /** ZIO's software transactional memory lets you create your own custom lock-free, race-free, concurrent structures, for
@@ -109,13 +157,26 @@ object StmBasics extends ZIOSpecDefault {
     suite("StmBasics") {
       test("latch") {
 
+        // Promise[Nothing, Unit] - we used this latch before to await something without anything inside
+
         /** EXERCISE
           *
           * Implement a simple concurrent latch.
           */
         final case class Latch(ref: TRef[Boolean]) {
-          def await: UIO[Any]   = ZIO.unit
-          def trigger: UIO[Any] = ZIO.unit
+
+          def await: UIO[Any] =
+            // transactional ref made to work with STM
+            ref.get.flatMap { completed =>
+              if (completed) STM.unit
+              // invalid state, needs to be retried
+              // it will only retry only if some variable inside transaction changed
+              // suspend until condition satisfied
+              else STM.retry
+            }.commit
+
+          def trigger: UIO[Any] =
+            ref.set(true).commit
         }
 
         def makeLatch: UIO[Latch] = TRef.make(false).map(Latch(_)).commit
@@ -124,12 +185,12 @@ object StmBasics extends ZIOSpecDefault {
           latch  <- makeLatch
           waiter <- latch.await.fork
           _      <- Live.live(Clock.sleep(10.millis))
-          first  <- waiter.poll
+          first <- waiter.poll // checks if fiber is complete
           _      <- latch.trigger
           _      <- Live.live(Clock.sleep(10.millis))
           second <- waiter.poll
         } yield assertTrue(first.isEmpty && second.isDefined)
-      } @@ ignore +
+      } +
         test("countdown latch") {
 
           /** EXERCISE
@@ -137,8 +198,14 @@ object StmBasics extends ZIOSpecDefault {
             * Implement a simple concurrent latch.
             */
           final case class CountdownLatch(ref: TRef[Int]) {
-            def await: UIO[Any]     = ZIO.unit
-            def countdown: UIO[Any] = ZIO.unit
+
+            def await: UIO[Int] =
+              ref.get.flatMap { int =>
+                if (int == 0) STM.succeed(int)
+                else STM.retry
+              }.commit
+
+            def countdown: UIO[Any] = ref.update(i => i - 1).commit
           }
 
           def makeLatch(n: Int): UIO[CountdownLatch] = TRef.make(n).map(ref => CountdownLatch(ref)).commit
@@ -149,11 +216,13 @@ object StmBasics extends ZIOSpecDefault {
             waiter <- latch.await.fork
             _      <- Live.live(Clock.sleep(10.millis))
             first  <- waiter.poll
+            _      <- ZIO.debug(first)
             _      <- latch.countdown
             _      <- Live.live(Clock.sleep(10.millis))
             second <- waiter.poll
+            _      <- ZIO.debug(second)
           } yield assertTrue(first.isEmpty && second.isDefined)
-        } @@ ignore +
+        } +
         test("permits") {
 
           /** EXERCISE
@@ -161,9 +230,18 @@ object StmBasics extends ZIOSpecDefault {
             * Implement `acquire` and `release` in a fashion the test passes.
             */
           final case class Permits(ref: TRef[Int]) {
-            def acquire(howMany: Int): UIO[Unit] = ???
+            private def acquire(howMany: Int): UIO[Unit] =
+              ref.get.flatMap { available =>
+                if (available >= howMany) ref.set(available - howMany)
+                else STM.retry
+              }.commit
 
-            def release(howMany: Int): UIO[Unit] = ???
+            private def release(howMany: Int): UIO[Unit] =
+              ref.update(_ + howMany).commit
+
+            // automatically release permits after zio is done so no manual release needed
+            def withPermits[R, E, A](howMany: Int)(zio: ZIO[R, E, A]): ZIO[R, E, A] =
+              ZIO.acquireReleaseWith(acquire(howMany))(_ => release(howMany))(_ => zio)
           }
 
           def makePermits(max: Int): UIO[Permits] = TRef.make(max).map(Permits(_)).commit
@@ -171,18 +249,18 @@ object StmBasics extends ZIOSpecDefault {
           for {
             counter <- Ref.make(0)
             permits <- makePermits(100)
-            _       <- ZIO.foreachPar(1 to 1000)(_ =>
-                         Random.nextIntBetween(1, 2).flatMap(n => permits.acquire(n) *> permits.release(n))
-                       )
+            _       <-
+              ZIO.foreachPar(1 to 1000)(_ => Random.nextIntBetween(1, 2).flatMap(n => permits.withPermits(n)(ZIO.unit)))
             latch   <- Promise.make[Nothing, Unit]
-            fiber   <- (latch.succeed(()) *> permits.acquire(101) *> counter.set(1)).forkDaemon
+            fiber   <- (latch.succeed(()) *>
+                         permits.withPermits(101)(counter.set(1))).forkDaemon
             _       <- latch.await
             _       <- Live.live(ZIO.sleep(1.second))
             _       <- fiber.interrupt
             count   <- counter.get
             permits <- permits.ref.get.commit
           } yield assertTrue(count == 0 && permits == 100)
-        } @@ ignore
+        }
     }
 }
 
@@ -210,12 +288,12 @@ object HubBasics extends ZIOSpecDefault {
           _       <- (latch.get.retryUntil(_ <= 0).commit *> ZIO.foreach(1 to 100)(hub.publish(_))).forkDaemon
           _       <- ZIO.foreachPar(1 to 100) { _ =>
                        ZIO.scoped(hub.subscribe.flatMap { queue =>
-                         latch.update(_ - 1).commit
+                         latch.update(_ - 1).commit *> queue.takeN(100)
                        })
                      }
           value   <- counter.get
         } yield assertTrue(value == 505000)
-      } @@ ignore
+      }
     }
 }
 
@@ -223,13 +301,45 @@ object HubBasics extends ZIOSpecDefault {
   *
   * To graduate from this section, you will choose and complete one of the following two problems:
   *
-  *   1. Implement a bulkhead pattern, which provides rate limiting to a group of services to protect other services
-  *      accessing a given resource.
-  *
-  * 2. Implement a CircuitBreaker, which triggers on too many failures, and which (gradually?) resets after a certain
-  * amount of time.
+  *   - Implement a bulkhead pattern, which provides rate limiting to a group of services to protect other services
+  *     accessing a given resource.
+  *   - Implement a CircuitBreaker, which triggers on too many failures, and which (gradually?) resets after a certain
+  *     amount of time.
   */
 object Graduation extends ZIOSpecDefault {
   def spec =
     suite("Graduation")()
+}
+
+trait WebService {
+  def get(id: Int): UIO[Int]
+  def put(id: Int, value: String): UIO[Int]
+}
+
+/** Question we might ask ourselfs:
+  *   - What errors "count" towards the CB?
+  *   - Do we want to have states (open, closed, etc) OR
+  *   - some concept of "continious state"
+  */
+trait CircuitBreaker {
+  def apply[R, E, A](zio: ZIO[R, E, A]): ZIO[R, E, A]
+}
+
+object CircuitBreaker {
+
+  def make: ZIO[Any, Nothing, CircuitBreaker] =
+    ???
+}
+
+object ExampleUsage {
+
+  val myWebService: WebService = ???
+
+  val run = for {
+    cb <- CircuitBreaker.make
+    ws  = new WebService {
+            override def get(id: Int): UIO[Int]                = cb(myWebService.get(id))
+            override def put(id: Int, value: String): UIO[Int] = cb(myWebService.put(id, value))
+          }
+  } yield ()
 }
