@@ -35,11 +35,11 @@ object SimpleConstructors extends ZIOSpecDefault {
       test("apply") {
         for {
           ref   <- Ref.make(0)
-          stream = ZStream[Int]()
+          stream = ZStream[Int](1, 2, 3, 4, 5)
           _     <- stream.foreach(value => ref.update(_ + value))
           v     <- ref.get
         } yield assertTrue(v == 15)
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Use the `ZStream.fromIterable` constructor to make a stream from the `iterable` value to make the unit test
@@ -50,11 +50,11 @@ object SimpleConstructors extends ZIOSpecDefault {
 
           for {
             ref   <- Ref.make(0)
-            stream = ZStream[Int]()
+            stream = ZStream.fromIterable(iterable)
             _     <- stream.foreach(value => ref.update(_ + value))
             v     <- ref.get
           } yield assertTrue(v == 15)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use the `ZStream.fromQueue` constructor to make a stream from the `queue` to make the unit test succeed.
@@ -64,11 +64,11 @@ object SimpleConstructors extends ZIOSpecDefault {
             ref   <- Ref.make(0)
             queue <- Queue.bounded[Int](100)
             _     <- (ZIO.foreach(0 to 100)(queue.offer(_)) *> queue.size.repeatUntil(_ == 0) *> queue.shutdown).forkDaemon
-            stream = ZStream[Int]()
+            stream = ZStream.fromQueue(queue)
             _     <- stream.foreach(value => ref.update(_ + value))
             v     <- ref.get
           } yield assertTrue(v == 5050)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use the `ZStream.fromZIO` constructor to convert the provided effect into a singleton stream.
@@ -79,25 +79,26 @@ object SimpleConstructors extends ZIOSpecDefault {
           for {
             ref   <- Ref.make("")
             _     <- TestConsole.feedLines("a", "b", "c")
-            stream = ZStream[String]()
+            stream = ZStream.fromZIO(effect)
             _     <- stream.foreach(value => ref.update(_ + value))
             v     <- ref.get
           } yield assertTrue(v == "a")
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use the `ZStream.fromFile` method to read the "build.sbt" file. Ignore the machinery that has NOT been
           * introduced yet, such as transduce.
           */
         test("fromFile") {
-          lazy val path   = FileSystems.getDefault().getPath("build.sbt")
+          lazy val path = FileSystems.getDefault().getPath("build.sbt")
+
           lazy val decode = ZPipeline.utf8Decode >>> ZPipeline.splitLines
 
           for {
-            _     <- (ZStream[Byte]() >>> decode).foreach(Console.printLine(_))
+            _     <- (ZStream.fromPath(path) >>> decode).foreach(Console.printLine(_))
             lines <- TestConsole.output
           } yield assertTrue(lines.exists(_.contains("zio-streams")))
-        } @@ ignore
+        }
     }
 }
 
@@ -114,72 +115,72 @@ object SimpleOperators extends ZIOSpecDefault {
         val stream = ZStream(1, 2, 3, 4, 5)
 
         for {
-          values <- (??? : UIO[Chunk[Int]])
+          values <- (stream.runCollect: UIO[Chunk[Int]]) // may stuck if stream is infinite or crash if memory not enough
         } yield assertTrue(values == Chunk(1, 2, 3, 4, 5))
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Insert a `take(2)` at the right place to take the first two elements of the stream.
           */
         test("take") {
           for {
-            values <- ZStream(1, 2, 3, 4).runCollect
+            values <- ZStream(1, 2, 3, 4).take(2).runCollect
           } yield assertTrue(values == Chunk(1, 2))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Insert a `takeWhile(_ < 3)` at the right place to take the first two elements of the stream.
           */
         test("takeWhile") {
           for {
-            values <- ZStream(1, 2, 3, 4).runCollect
+            values <- ZStream(1, 2, 3, 4).takeWhile(_ < 3).runCollect
           } yield assertTrue(values == Chunk(1, 2))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Insert a `drop(2)` at the right place to drop the first two elements of the stream.
           */
         test("drop") {
           for {
-            values <- ZStream(1, 2, 3, 4).runCollect
+            values <- ZStream(1, 2, 3, 4).drop(2).runCollect
           } yield assertTrue(values == Chunk(3, 4))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Insert a `dropWhile(_ < 3)` at the right place to drop the first two elements of the stream.
           */
         test("dropWhile") {
           for {
-            values <- ZStream(1, 2, 3, 4).runCollect
+            values <- ZStream(1, 2, 3, 4).dropWhile(_ < 3).runCollect
           } yield assertTrue(values == Chunk(3, 4))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Insert a `map(_ * 2)` at the right place.
           */
         test("map") {
           for {
-            values <- ZStream(1, 2, 3).runCollect
+            values <- ZStream(1, 2, 3).map(_ * 2).runCollect
           } yield assertTrue(values == Chunk(2, 4, 6))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Insert a `filter(_ % 2 == 0)` at the right place to filter out all the odd numbers.
           */
         test("filter") {
           for {
-            values <- ZStream(1, 2, 3, 4, 5, 6).runCollect
+            values <- ZStream(1, 2, 3, 4, 5, 6).filter(_ % 2 == 0).runCollect
           } yield assertTrue(values == Chunk(2, 4, 6))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Insert a `.forever` call at the right place.
           */
         test("forever") {
           for {
-            values <- ZStream(1).take(5).runCollect
+            values <- ZStream(1).forever.take(5).runCollect
           } yield assertTrue(values == Chunk(1, 1, 1, 1, 1))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use `++` to concatenate the two streams together.
@@ -189,9 +190,9 @@ object SimpleOperators extends ZIOSpecDefault {
           val stream2 = ZStream(4, 5, 6)
 
           for {
-            values <- stream1.runCollect
+            values <- (stream1 ++ stream2).runCollect
           } yield assertTrue(values == Chunk(1, 2, 3, 4, 5, 6))
-        } @@ ignore
+        }
     }
 }
 
@@ -207,9 +208,9 @@ object RunningStreams extends ZIOSpecDefault {
         val stream = ZStream("All work and no play makes Jack a dull boy").forever
 
         for {
-          headOption <- ZIO.succeed(Option.empty[String])
+          headOption <- stream.runHead
         } yield assertTrue(headOption == Some("All work and no play makes Jack a dull boy"))
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Use `.runDrain` to run a stream by draining all of its elements and throwing them away (change the
@@ -220,10 +221,10 @@ object RunningStreams extends ZIOSpecDefault {
 
           for {
             drained   <- Ref.make(false)
-            _         <- (stream ++ ZStream.fromZIO(drained.set(true)).drain).runHead
+            _         <- (stream ++ ZStream.fromZIO(drained.set(true))).runDrain
             isDrained <- drained.get
           } yield assertTrue(isDrained)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use `.runCount` to drain the stream and count how many things were emitted by the stream (change the
@@ -233,9 +234,9 @@ object RunningStreams extends ZIOSpecDefault {
           val stream = ZStream.fromIterable(0 to 100)
 
           for {
-            count <- stream.runHead.some
+            count <- stream.runCount
           } yield assertTrue(count == 101)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use `.run` with the provided "sink" to count the number of things that were emitted by the stream (change
@@ -246,9 +247,9 @@ object RunningStreams extends ZIOSpecDefault {
           val sink   = ZSink.count
 
           for {
-            count <- stream.runHead.some
+            count <- stream.run(sink)
           } yield assertTrue(count == 101)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use `.fold` to fold over the stream, summing all the elements.
@@ -257,9 +258,9 @@ object RunningStreams extends ZIOSpecDefault {
           val stream = ZStream.fromIterable(0 to 100)
 
           for {
-            sum <- stream.runHead.some
+            sum <- stream.runFold(0)(_ + _)
           } yield assertTrue(sum == 5050)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use `.foldZIO` to fold over a stream of questions, asking responses, and aggregating them into a map.
@@ -272,13 +273,13 @@ object RunningStreams extends ZIOSpecDefault {
 
           for {
             _   <- TestConsole.feedLines(expected.values.toVector: _*)
-            map <- questions.run(ZSink.foldLeft(Map.empty[String, String]) { case (map, question) =>
-                     val answer = question
-
-                     map + (question -> answer)
-                   })
+            map <- questions.runFoldZIO(Map.empty[String, String]) { case (map, question) =>
+                     Console.readLine.map { answer =>
+                       map + (question -> answer)
+                     }
+                   }
           } yield assertTrue(map == expected)
-        } @@ ignore
+        }
     }
 }
 
@@ -290,14 +291,19 @@ object AdvancedConstructors extends ZIOSpecDefault {
         *
         * Use the ZStream.unfold constructor that can be used for statefully "unfolding" a finite or infinite stream
         * from an initial value.
+        *
+        * Good for paginating (?)
         */
       test("unfold") {
-        val fibs: ZStream[Any, Nothing, Int] = ZStream()
+        val fibs: ZStream[Any, Nothing, Int] =
+          ZStream.unfold((0, 1)) { case (a, b) =>
+            Some((a, (b, a + b)))
+          }
 
         for {
           values <- fibs.take(5).runCollect
         } yield assertTrue(values == Chunk(0, 1, 1, 2, 3))
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Use `ZStream.repeatZIO` to construct a stream whose elements are constructed by repeatedly executing the
@@ -341,12 +347,12 @@ object AdvancedOperators extends ZIOSpecDefault {
         * Using `flatMap`, turn the provided stream into one where every element is replicated 3 times.
         */
       test("flatMap") {
-        val stream = ZStream(1, 2, 3)
+        val stream = ZStream(1, 2, 3).flatMap(n => ZStream(n, n, n))
 
         for {
           values <- stream.runCollect
         } yield assertTrue(values == Chunk(1, 1, 1, 2, 2, 2, 3, 3, 3))
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Insert a `.mapZIO` to print out each question using Console.printLine and ask for a response using
@@ -372,7 +378,12 @@ object AdvancedOperators extends ZIOSpecDefault {
           val stream = ZStream("blue", "red", "blue", "red")
 
           def aggregate(stream: Stream[Nothing, String]): Stream[Nothing, (String, Int)] =
-            ???
+            stream.mapAccum[Map[String, Int], (String, Int)](Map.empty) { case (map, string) =>
+              map.get(string) match {
+                case Some(count) => (map + (string -> (count + 1)), (string -> (count + 1)))
+                case None        => (map + (string -> 1), (string -> 1))
+              }
+            }
 
           for {
             tuple <- aggregate(stream).runLast.some
@@ -391,16 +402,16 @@ object BasicError extends ZIOSpecDefault {
         */
       test("fail") {
         for {
-          value <- (ZStream(): Stream[String, Int]).runCollect.either
+          value <- ZStream.fail("Uh oh!").runCollect.either
         } yield assertTrue(value == Left("Uh oh!"))
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Use `.catchAll` to catch the error and turn it into a singleton stream.
           */
         test("catchAll") {
           for {
-            value <- (ZStream.fail("Uh oh!"): Stream[String, String]).runCollect
+            value <- ZStream.fail("Uh oh!").catchAll(string => ZStream(string)).runCollect
           } yield assertTrue(value == Chunk("Uh oh!"))
         }
     }
@@ -418,9 +429,9 @@ object TemporalStreams extends ZIOSpecDefault {
         val schedule = Schedule.recurs(100)
 
         for {
-          values <- ZStream().runCollect
+          values <- ZStream.fromSchedule(schedule).runCollect
         } yield assertTrue(values.length == 100)
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Use `ZStream.repeatZIOWithSchedule` to repeat the provided effect according to the provided schedule.
@@ -429,13 +440,13 @@ object TemporalStreams extends ZIOSpecDefault {
           val effect   = Console.printLine("All work and no play makes Jack a dull boy")
           val schedule = Schedule.recurs(100)
 
-          val s = ZStream()
+          val s = ZStream.repeatZIOWithSchedule(effect, schedule)
 
           for {
-            _     <- ZStream().runDrain
+            _     <- s.runDrain
             lines <- TestConsole.output
           } yield assertTrue(lines.length == 101)
-        } @@ ignore
+        }
     }
 }
 
@@ -452,10 +463,10 @@ object ChunkedStreams extends ZIOSpecDefault {
 
         for {
           chunkCount <- Ref.make(0)
-          chunks     <- stream.foreach(_ => chunkCount.update(_ + 1))
+          chunks     <- stream.runForeachChunk(_ => chunkCount.update(_ + 1))
           v          <- chunkCount.get
         } yield assertTrue(v == 1)
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Map over the chunks backing the provided stream with `mapChunks`, reversing each of them.
@@ -464,9 +475,9 @@ object ChunkedStreams extends ZIOSpecDefault {
           val stream = ZStream.fromChunks(Chunk(1), Chunk(2), Chunk(3, 4), Chunk(5, 6, 7, 8, 9))
 
           for {
-            values <- stream.runCollect
+            values <- stream.mapChunks(_.reverse).runCollect
           } yield assertTrue(values == Chunk(1, 2, 4, 3, 9, 8, 7, 6, 5))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Provide a correct implementation of `chunked` that exposes the chunks underlying a stream.
@@ -475,12 +486,12 @@ object ChunkedStreams extends ZIOSpecDefault {
           val stream = ZStream.fromChunks(Chunk(1), Chunk(2), Chunk(3, 4), Chunk(5, 6, 7, 8, 9))
 
           def chunked[R, E, A](stream: ZStream[R, E, A]): ZStream[R, E, Chunk[A]] =
-            stream.map(c => Chunk(c))
+            stream.mapChunks(c => Chunk(c))
 
           for {
             chunks <- chunked(stream).runCollect
           } yield assertTrue(chunks.length == 4)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Implement a correct version of `unchunked` that hides the chunks into the stream.
@@ -489,13 +500,13 @@ object ChunkedStreams extends ZIOSpecDefault {
           val stream = ZStream(Chunk(1), Chunk(2), Chunk(3, 4), Chunk(5, 6, 7, 8, 9))
 
           def unchunked[R, E, A](stream: ZStream[R, E, Chunk[A]]): ZStream[R, E, A] =
-            stream.map(_.head)
+            stream.mapChunks(c => c.flatten)
 
           for {
             values1 <- unchunked(stream).runCollect
             values2 <- stream.flattenChunks.runCollect
           } yield assertTrue(values1 == values2)
-        } @@ ignore
+        }
     }
 }
 
