@@ -22,24 +22,47 @@ object Introduction extends ZIOSpecDefault {
       test(">>>") {
         val stream = ZStream.range(1, 10)
         val trans  = ZPipeline.take[Int](5)
+        val sink   = ZSink.collectAll[Int]
 
         for {
-          chunks <- stream.runCollect
+          chunks <- (stream >>> trans >>> sink)
         } yield assertTrue(chunks.length == 5)
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
-          * Using `.transduce`, transform the elements of this stream by the provided pipeline.
+          * Using `.via`, transform the elements of this stream by the provided pipeline.
           */
-        test("transduce") {
+        test("via") {
           val stream = ZStream.range(1, 100)
           val trans  = ZPipeline.take[Int](10)
 
           for {
-            values <- stream.runCollect
+            values <- stream.via(trans).runCollect
           } yield assertTrue(values.length == 10)
-        } @@ ignore
+        }
     }
+}
+
+object TransduceExample extends ZIOAppDefault {
+
+  val stream = ZStream(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+  val sink   = ZSink.collectAllN[Int](2)
+
+  // stream.run(sink).debug // Chunk(1,2)
+
+  // stream.transduce(sink).debug.runDrain
+  // transduce will repeat sink on the sink:
+  // Chunk(1, 2)
+  // Chunk(3, 4)
+  // Chunk(5, 6)
+  // Chunk(7, 8)
+  // Chunk(9, 10)
+  // Chunk()
+
+  val pipeline = ZPipeline.fromSink(sink)
+
+  // the same as transduce, just repeating sink (originally sink works only once)
+  val run = (stream >>> pipeline).debug.runDrain
 }
 
 object Constructors extends ZIOSpecDefault {
@@ -54,9 +77,9 @@ object Constructors extends ZIOSpecDefault {
         val stream = ZStream("a\nb\nc\n", "d\ne")
 
         for {
-          values <- stream.runCollect
+          values <- stream.via(ZPipeline.splitLines).runCollect
         } yield assertTrue(values == Chunk("a", "b", "c", "d", "e"))
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Using `ZPipeline.splitOn(",")`, transform the stream elements so they are split on newlines.
@@ -65,9 +88,9 @@ object Constructors extends ZIOSpecDefault {
           val stream = ZStream("name,age,add", "ress,dob,gender")
 
           for {
-            values <- stream.runCollect
+            values <- stream.via(ZPipeline.splitOn(",")).runCollect
           } yield assertTrue(values == Chunk("name", "age", "address", "dob", "gender"))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Using `ZPipeline.utf8Decode`, transform the stream elements so they are UTF8 decoded.
@@ -79,26 +102,26 @@ object Constructors extends ZIOSpecDefault {
           val stream = ZStream.fromChunks(Chunk.fromArray(bytes1), Chunk.fromArray(bytes2))
 
           def decodedStream: ZStream[Any, Nothing, String] =
-            stream >>> ???
+            stream >>> ZPipeline.utf8Decode.orDie >>> ZPipeline.filter(_.nonEmpty)
 
           for {
             values <- decodedStream.runCollect
           } yield assertTrue(values == Chunk("Hello", "World!"))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
-          * Using `ZPipeline.fromFunction`, create a pipeline that converts strings to ints.
+          * Using `ZPipeline.map`, create a pipeline that converts strings to ints.
           */
-        test("fromFunction") {
+        test("map") {
           def parseInt: ZPipeline[Any, Nothing, String, Int] =
-            ???
+            ZPipeline.map(_.toInt)
 
           val stream = ZStream("1", "2", "3")
 
           for {
             values <- (stream >>> parseInt).runCollect
           } yield assertTrue(values == Chunk(1, 2, 3))
-        } @@ ignore
+        }
     }
 }
 
@@ -120,7 +143,59 @@ object Operators extends ZIOSpecDefault {
               Chunk.fromArray(string.getBytes(StandardCharsets.UTF_8))
             } >>> ZPipeline.mapChunks(_.flatten)
 
-        def composed = utf8Encode >>> utf8Decode
+        val toChar: ZPipeline[Any, Nothing, String, Char] =
+          ZPipeline.mapChunks(chunk => chunk.flatMap(s => s))
+
+        val splitWords = {
+          import zio.stream.ZChannel
+
+          // AllWorkAndNoPlayMakesJackADullBoy
+          // this channel will get merged string, divide by upper case
+          def channel(
+              leftovers: Chunk[Char]
+          ): ZChannel[Any, ZNothing, Chunk[String], Any, ZNothing, Chunk[String], Any] =
+            ZChannel.readWith(
+              in => {
+                val chars                 = leftovers ++ in.flatten
+                val (words, leftoversNew) = extractWords(chars)
+                ZChannel.write(words) *> channel(leftovers)
+              },
+              err => ZChannel.fail(err),
+              done => ZChannel.succeed(done)
+            )
+
+          // wtf...
+          def extractWords(chars: Chunk[Char]): (Chunk[String], Chunk[Char]) = {
+            val iterator         = chars.iterator
+            val wordBuilder      = ChunkBuilder.make[String]()
+            val leftoversBuilder = ChunkBuilder.make[Char]()
+
+            var started       = false
+            var stringBuilder = new StringBuilder
+
+            while (iterator.hasNext) {
+              val char = iterator.next()
+              if (char.isUpper && started) {
+                val string = stringBuilder.toString()
+                wordBuilder += string
+                stringBuilder = new StringBuilder
+                stringBuilder += char
+              } else {
+                started = true
+                stringBuilder += char
+              }
+            }
+            wordBuilder += stringBuilder.toString()
+            (wordBuilder.result(), leftoversBuilder.result())
+          }
+
+          ZPipeline.fromChannel(channel(Chunk.empty))
+        }
+
+        def composed = utf8Encode >>>
+          utf8Decode >>>
+          splitWords >>>
+          ZPipeline.filter[String](_.nonEmpty)
 
         val chunk = Chunk("All", "Work", "And", "No", "Play", "Makes", "Jack", "A", "Dull", "Boy")
 
@@ -129,7 +204,7 @@ object Operators extends ZIOSpecDefault {
         for {
           values <- (stream >>> composed).runCollect
         } yield assertTrue(values == chunk)
-      } @@ ignore
+      }
     }
 }
 
