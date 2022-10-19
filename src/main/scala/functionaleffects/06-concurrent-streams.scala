@@ -22,9 +22,9 @@ object ConcurrencyOps extends ZIOSpecDefault {
         val stream = ZStream(1).forever
 
         Live.live(for {
-          size <- stream.runHead
+          size <- stream.runHead.timeout(10.millis)
         } yield assertTrue(size.isEmpty))
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Use `.mapPar` to apply the mapping in parallel.
@@ -35,10 +35,11 @@ object ConcurrencyOps extends ZIOSpecDefault {
 
           val stream = ZStream.range(0, 10)
 
+          // operator for parallel (10 fibers) computation of map function
           for {
-            fibs <- stream.map(fib(_)).runCollect
+            fibs <- stream.mapZIOPar(10)(n => ZIO.succeed(fib(n))).runCollect
           } yield assertTrue(fibs == Chunk(0, 1, 1, 2, 3, 5, 8, 13, 21, 34))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use `.flatMapPar` to apply the flatMap in parallel.
@@ -49,16 +50,18 @@ object ConcurrencyOps extends ZIOSpecDefault {
 
           val stream = ZStream("Sherlock", "John", "Mycroft")
 
+          // flatMapPar not preventing the original order of elements
           for {
-            ages <- stream.flatMap(lookupAge(_)).runCollect
-          } yield assertTrue(ages == Chunk(42, 43, 48))
-        } @@ ignore +
+            ages <- stream.flatMapPar(4, 16)(lookupAge(_)).runCollect
+          } yield assertTrue(ages.toSet == Set(42, 43, 48))
+        } @@ nonFlaky +
         /** EXERCISE
           *
           * Find the right place to complete the promise that will interrupt the provided infinite stream.
           */
         test("interruptWhen") {
-          def makeStream(ref: Ref[Int]) = ZStream(1).tap(i => ref.update(_ + i)).forever
+          def makeStream(ref: Ref[Int]) =
+            ZStream(1).tap(i => ref.update(_ + i)).forever
 
           Live.live(for {
             ref     <- Ref.make(0)
@@ -66,9 +69,10 @@ object ConcurrencyOps extends ZIOSpecDefault {
             promise <- Promise.make[Nothing, Unit]
             _       <- makeStream(ref).interruptWhen(promise).ensuring(done.succeed(())).runDrain.forkDaemon
             _       <- (ref.get <* ZIO.yieldNow).repeatUntil(_ > 0)
+            _ <- promise.succeed(()) // it interrputs the makeStream(ref).interruptWhen from before
             result  <- done.await.disconnect.timeout(1.second)
           } yield assertTrue(result.isDefined))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Using `.merge`, perform a concurrent merge of two streams.
@@ -78,9 +82,9 @@ object ConcurrencyOps extends ZIOSpecDefault {
           val stream2 = ZStream("2").forever
 
           for {
-            values <- stream1.take(10).runCollect
+            values <- stream1.merge(stream2).take(10).runCollect.debug
           } yield assertTrue(values.contains("1") && values.contains("2"))
-        } @@ flaky @@ ignore +
+        } @@ flaky +
         /** EXERCISE
           *
           * Use `broadcast` to send one stream to 10 consumers, each of which is created with the provided `consumer`
@@ -94,22 +98,31 @@ object ConcurrencyOps extends ZIOSpecDefault {
 
           for {
             ref <- Ref.make(0)
+            // when scope closed - all subscribers will be cutoff
+            _   <- stream.broadcast(10, 10).flatMap { streams =>
+                     ZIO.foreachPar(streams)(consumer(ref, _))
+                   }
             v   <- ref.get
           } yield assertTrue(v == 100)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use `aggregateAsync` on a sink created with `ZSink.foldUntil` that sums up every pair of elements.
           */
         test("aggregateAsync(foldUntil(...))") {
-          val stream = ZStream(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+          val stream = ZStream(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
 
-          def sink: ZSink[Any, Nothing, Int, Nothing, Int] = ???
+          // different from transduce because it is async
+          // transduce always running the stream repeatedly controlled by downstream
+          def sink: ZSink[Any, Nothing, Int, Int, Int] =
+            ZSink.foldUntil[Int, Int](0, 2)(_ + _)
 
+          // aggregateAsync creates upstream and downstream (two regions/fibers)
+          // now they are not poll-based, they have two regions which runs separately
           for {
             values <- stream.aggregateAsync(sink).runCollect
           } yield assertTrue(values == Chunk(1, 5, 9, 13, 17))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use `aggregateAsync` on a sink created with `ZSink.foldWeighted` to group elements into chunks of size 2.
