@@ -13,6 +13,26 @@ import zio.stream._
 import zio.test._
 import zio.test.TestAspect._
 
+// R - environment (Any)
+// E - error (Nothing)
+// In - input that sink knows how to hanlde (consumes String, etc)
+// L - type of leftovers that the sink can produce (Nothing - never produce any leftovers)
+// Z - summary value that sink produces (single value at the end of running the sink Unit, Any)
+// final class ZSink[R, E, In, L, Z]
+
+object SinkExample extends ZIOAppDefault {
+
+  // 4096 - default chank size, setup 10 chunk size
+  val stream = ZStream.fromIterable(1 to 10).rechunk(10)
+
+  val sink = ZSink.collectAllN[Int](5)
+  // We will take only 5 first elements and put into chunk but stream is 10 elements
+  // what is it going to do with 5 left?
+  // we can connect sink with another sink that will take another 5 elements
+
+  val run = ???
+}
+
 object Constructors extends ZIOSpecDefault {
   def spec =
     suite("Constructors") {
@@ -25,9 +45,9 @@ object Constructors extends ZIOSpecDefault {
         val stream = ZStream(1, 2, 3, 4)
 
         for {
-          size <- stream.runSum
+          size <- stream.run(ZSink.count)
         } yield assertTrue(size.toInt == 4)
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Replace the call to `.runCollect` by a call to `run` using `ZSink.take(2)`.
@@ -36,9 +56,9 @@ object Constructors extends ZIOSpecDefault {
           val stream = ZStream(1, 2, 3, 4)
 
           for {
-            two <- stream.runCollect
+            two <- stream.run(ZSink.take(2))
           } yield assertTrue(two == Chunk(1, 2))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Replace the call to `.runDrain` by a call to `run` using `ZSink.foreach`, specifying a callback that
@@ -49,10 +69,10 @@ object Constructors extends ZIOSpecDefault {
 
           for {
             ref <- Ref.make(0)
-            _   <- stream.runDrain
+            _   <- stream.run(ZSink.foreach(v => ref.update(_ + v)))
             v   <- ref.get
           } yield assertTrue(v == 10)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Replace the call to `.runSum` by a call to `run` using a sink constructed with `ZSink.foldLeft` that
@@ -62,9 +82,11 @@ object Constructors extends ZIOSpecDefault {
           val stream = ZStream(1, 2, 3, 4)
 
           for {
-            value <- stream.runSum
+            value <- stream.run(ZSink.foldLeft(1)(_ * _))
           } yield assertTrue(value == 24)
-        } @@ ignore
+        }
+
+      // using logic in separate ZSink might be more composible
     }
 }
 
@@ -83,37 +105,37 @@ object Operators extends ZIOSpecDefault {
         val stream = ZStream(1, 2, 3, 4)
 
         for {
-          value <- stream.runCount
+          value <- stream.run(sink)
         } yield assertTrue(value == 4)
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Use `zipPar` to parallel zip `ZSink.count` and `ZSink.sum` together, to produce a tuple of their outputs.
           */
         test("zipPar") {
           def zippedSink: ZSink[Any, Nothing, Int, Nothing, (Long, Int)] =
-            ???
+            ZSink.count.zipPar(ZSink.sum[Int])
 
           val stream = ZStream(1, 2, 3, 4)
 
           for {
             value <- stream.run(zippedSink)
           } yield assertTrue(value == (4L, 10))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use `zip` to zip `ZSink.take(3)` and `ZSink.collectAll[Int]` together, to produce a tuple of their outputs.
           */
         test("zip") {
           def zippedSink: ZSink[Any, Nothing, Int, Int, (Chunk[Int], Chunk[Int])] =
-            ???
+            ZSink.take(3).zip(ZSink.collectAll[Int])
 
           val stream = ZStream(1, 2, 3, 4)
 
           for {
             value <- stream.run(zippedSink)
           } yield assertTrue(value == (Chunk(1, 2, 3), Chunk(4)))
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Use `ZSink.take` and `ZSink.collectAll` in the provided `for` comprehension to make the test pass.
@@ -121,8 +143,8 @@ object Operators extends ZIOSpecDefault {
         test("flatMap") {
           val sink =
             for {
-              two       <- ZSink.collectAll[Int]
-              three     <- ZSink.collectAll[Int]
+              two       <- ZSink.take[Int](2)
+              three     <- ZSink.take[Int](3)
               remainder <- ZSink.collectAll[Int]
             } yield (two, three, remainder)
 
@@ -131,7 +153,7 @@ object Operators extends ZIOSpecDefault {
           for {
             chunks <- stream.run(sink)
           } yield assertTrue(chunks == (Chunk(1, 2), Chunk(3, 4, 5), Chunk(6)))
-        } @@ ignore
+        }
     }
 }
 
