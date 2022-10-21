@@ -1,10 +1,7 @@
-/**
- * ZIO can help structure your application according to best practices.
- * By breaking up your application into services, each of which interacts
- * with other services through interfaces, and whose implementations are
- * wired up through layers, ZIO can provide a robust, type-safe, and
- * testable scaffolding on which your application can grow and thrive.
- */
+/** ZIO can help structure your application according to best practices. By breaking up your application into services,
+  * each of which interacts with other services through interfaces, and whose implementations are wired up through
+  * layers, ZIO can provide a robust, type-safe, and testable scaffolding on which your application can grow and thrive.
+  */
 package advancedfunctionaleffects.architecture
 
 import zio._
@@ -47,16 +44,14 @@ package payments {
     case object InsufficientBalance           extends Exception("Insufficient balance")
     final case class Unknown(message: String) extends Exception(message)
   }
-  trait PaymentProcessor {
+  trait PaymentProcessor     {
     def charge(paymentMethod: PaymentMethod, amount: Double): IO[PaymentProcessError, Unit]
   }
 
-  /**
-   * EXERCISE
-   *
-   * Create a mock implementation of `PaymentProcessor`, together with a
-   * layer to describe its creation.
-   */
+  /** EXERCISE
+    *
+    * Create a mock implementation of `PaymentProcessor`, together with a layer to describe its creation.
+    */
   final case class PaymentProcessorLive()
 }
 
@@ -67,12 +62,10 @@ package db {
     def query(query: String): ZIO[Scope, java.io.IOException, java.sql.ResultSet]
   }
 
-  /**
-   * EXERCISE
-   *
-   * Create a mock implementation of `Database`, together with a
-   * layer to describe its creation.
-   */
+  /** EXERCISE
+    *
+    * Create a mock implementation of `Database`, together with a layer to describe its creation.
+    */
   final case class DatabaseLive()
 }
 
@@ -85,40 +78,33 @@ package orders {
     def updateOrder(order: Order): IO[IOException, Unit]
   }
 
-  /**
-   * EXERCISE
-   *
-   * Create a mock implementation of `OrderRepo`, together with a
-   * layer to describe its creation.
-   */
+  /** EXERCISE
+    *
+    * Create a mock implementation of `OrderRepo`, together with a layer to describe its creation.
+    */
   final case class OrderRepoLive()
 }
 
 package comms {
-  trait Emailer {
+  trait Emailer   {
     def sendEmail(subject: String, body: String, to: String, from: String): Task[Unit]
   }
 
-  /**
-   * EXERCISE
-   *
-   * Create a mock implementation of `Emailer`, together with a
-   * layer to describe its creation.
-   */
+  /** EXERCISE
+    *
+    * Create a mock implementation of `Emailer`, together with a layer to describe its creation.
+    */
   final case class EmailerLive()
 }
 
 object core {
   import domain._
 
-  /**
-   * EXERCISE
-   *
-   * Mock out an implementation of this method, which should attempt to
-   * verify the order is in a state to be charged, then attempt to charge
-   * the order, then update the state of the order, then send an email
-   * to the user indicating the order was successful. If the charge was
-   * not successful, then an error needs to be created to indicate why.
-   */
+  /** EXERCISE
+    *
+    * Mock out an implementation of this method, which should attempt to verify the order is in a state to be charged,
+    * then attempt to charge the order, then update the state of the order, then send an email to the user indicating
+    * the order was successful. If the charge was not successful, then an error needs to be created to indicate why.
+    */
   def placeOrder(order: Order) = ???
 }
