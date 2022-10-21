@@ -16,6 +16,37 @@ import zio.test.TestAspect._
 
 import scala.concurrent.ExecutionContext
 import java.util.concurrent.atomic.AtomicReference
+import java.io.IOException
+import scala.reflect.ClassTag
+
+/** Most effect frameworks have default runtime configurations
+  *
+  * But they could be tweaked for some production use
+  */
+object RuntimeExample extends App {
+
+  val sayHello =
+    ZIO.logInfo("Hello, World")
+
+  /** Runtime contains:
+    *   - environment (bundle of vervices: database, logging, etc)
+    *   - fiber refs (contains configuration information, like ThreadLocal in Java)
+    *   - runtime flags - ZIO features and stuff like that
+    */
+  val runtime =
+    Runtime.default
+
+  // sayHello.unsafeRunSync - we have no such thing in ZIO
+  def unsafeRunDefault[E, A](zio: ZIO[Any, E, A])(implicit unsafe: Unsafe): A =
+    runtime.unsafe.run(zio).getOrThrowFiberFailure()
+
+  // unsafe is a compatibility - it made into implicit requirement to make sure everyone
+  // see the unsafe things
+  Unsafe.unsafe { implicit u =>
+    unsafeRunDefault(sayHello)
+  }
+
+}
 
 object RuntimeSpec extends ZIOSpecDefault {
   implicit def unsafe: Unsafe = null.asInstanceOf[zio.Unsafe]
@@ -39,16 +70,19 @@ object RuntimeSpec extends ZIOSpecDefault {
         * passes.
         */
       test("Runtime") {
-        val effect: ZIO[Int, Nothing, Int] =
+        val effect: ZIO[Int & String, Nothing, Int] =
           for {
-            integer <- ZIO.environment[Int]
-            _       <- ZIO.debug(integer)
-          } yield integer.get[Int] * 2
+            env    <- ZIO.environment[Int & String]
+            integer = env.get[Int]
+            str     = env.get[String]
+            _      <- ZIO.debug(integer)
+            _      <- ZIO.debug(str)
+          } yield integer * 2
 
-        val runtime = Runtime(ZEnvironment(19), FiberRefs.empty, RuntimeFlags.default)
+        val runtime = Runtime(ZEnvironment(21, "Adam"), FiberRefs.empty, RuntimeFlags.default)
 
         assertTrue(runtime.unsafe.run(effect) == Exit.succeed(42))
-      } @@ ignore +
+      } +
         /** EXERCISE
           *
           * Anytime a fiber crashes with a catastrophic error (such stack overflow error), the signal is sent to the
@@ -70,13 +104,23 @@ object RuntimeSpec extends ZIOSpecDefault {
             throw t
           }
 
-          val runtime = Runtime(ZEnvironment.empty, FiberRefs.empty, RuntimeFlags.default)
+          // default ZIO runtime shut down program at error
+          // handler could be set through Runtime
+          val runtime =
+            Runtime.unsafe.fromLayer(Runtime.setReportFatal(captureFatal))
+          // Runtime(ZEnvironment.empty, FiberRefs.empty, RuntimeFlags.default)
 
-          try runtime.unsafe.run(ZIO.succeed(throw fatalError))
+          try runtime.unsafe
+            .run(
+              ZIO
+                .succeed(throw fatalError)
+              // adding fatal failure handler
+              // .provide(Runtime.setReportFatal(captureFatal))
+            )
           catch { case _: Throwable => () }
 
           assertTrue(fatalRef.get.get == fatalError)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * Some advanced functionality, such as converting a `FiberRef` into a JVM `ThreadLocal`, requires that the
@@ -87,12 +131,12 @@ object RuntimeSpec extends ZIOSpecDefault {
           * Create a Runtime where the current fiber is enabled so the following unit test will pass.
           */
         test("enableCurrentFiber") {
-          val runtime = Runtime(ZEnvironment.empty, FiberRefs.empty, RuntimeFlags.default)
+          val runtime = Runtime.unsafe.fromLayer(Runtime.enableCurrentFiber)
 
           val option = runtime.unsafe.run(ZIO.attempt(Fiber.currentFiber()(unsafe))).getOrThrowFiberFailure()
 
           assertTrue(option.isDefined)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * ZIO executes all fibers using an `Executor`, which is a ZIO-defined facade over task execution. Executors
@@ -123,12 +167,14 @@ object RuntimeSpec extends ZIOSpecDefault {
             }
           }
 
-          val runtime = Runtime(ZEnvironment.empty, FiberRefs.empty, RuntimeFlags.default)
+          // eg: run zio staff on akka thread pool
+          val runtime =
+            Runtime.unsafe.fromLayer(Runtime.setExecutor(executor))
 
           runtime.unsafe.run(ZIO.yieldNow *> ZIO.unit)
 
           assertTrue(ranOnEC.get == true)
-        } @@ ignore +
+        } +
         /** EXERCISE
           *
           * ZIO has special behavior for defects (thrown exceptions) that are deemed fatal (_catastrophic_). Fatal
@@ -148,6 +194,7 @@ object RuntimeSpec extends ZIOSpecDefault {
           * not throw exceptions from pure code.
           */
         test("isFatal") {
+          // IO is not considered to be a FatalError
           val ioException = new java.io.IOException("Cannot read some bytes from somewhere")
 
           val fatalRef = new java.util.concurrent.atomic.AtomicReference[Option[Throwable]](None)
@@ -157,13 +204,18 @@ object RuntimeSpec extends ZIOSpecDefault {
             throw t
           }
 
+          val runtime = Runtime.unsafe.fromLayer(
+            Runtime.setReportFatal(captureFatal) ++
+              Runtime.addFatal(classOf[Throwable])
+          )
+
           Runtime.default.unsafe.run {
             ZIO.succeed(throw ioException) // HERE
           }
 
           assertTrue(fatalRef.get.get == ioException)
         }
-    } @@ jvmOnly @@ ignore +
+    } @@ jvmOnly +
       /** EXERCISE
         *
         * ZIO's runtime configuration allows specification of a supervisor, which is an incredibly powerful hook into
